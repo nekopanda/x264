@@ -155,6 +155,8 @@ typedef struct {
     FILE *tcfile_out;
     double timebase_convert_multiplier;
     int i_pulldown;
+    char *pdfile_data;
+    int i_pdfile_frames;
 } cli_opt_t;
 
 /* file i/o operation structs */
@@ -392,6 +394,8 @@ int main( int argc, char **argv )
         fclose( opt.tcfile_out );
     if( opt.qpfile )
         fclose( opt.qpfile );
+    if( opt.pdfile_data )
+        free( opt.pdfile_data );
 
 #ifdef _WIN32
     SetConsoleTitleW( org_console_title );
@@ -926,6 +930,7 @@ static void help( x264_param_t *defaults, int longhelp )
     H2( "      --force-cfr             Force constant framerate timestamp generation\n" );
     H2( "      --tcfile-in <string>    Force timestamp generation with timecode file\n" );
     H2( "      --tcfile-out <string>   Output timecode v2 file from input timestamps\n" );
+    H2( "      --pdfile-in <string>    Apply pulldown from input pic_struct file\n" );
     H2( "      --timebase <int/int>    Specify timebase numerator and denominator\n"
         "                 <integer>    Specify timebase numerator for input timecode file\n"
         "                              or specify timebase denominator for other input\n" );
@@ -964,6 +969,7 @@ typedef enum
     OPT_INTERLACED,
     OPT_TCFILE_IN,
     OPT_TCFILE_OUT,
+    OPT_PDFILE_IN,
     OPT_TIMEBASE,
     OPT_PULLDOWN,
     OPT_LOG_LEVEL,
@@ -1126,6 +1132,7 @@ static struct option long_options[] =
     { "force-cfr",         no_argument, NULL, 0 },
     { "tcfile-in",   required_argument, NULL, OPT_TCFILE_IN },
     { "tcfile-out",  required_argument, NULL, OPT_TCFILE_OUT },
+    { "pdfile-in",   required_argument, NULL, OPT_PDFILE_IN },
     { "timebase",    required_argument, NULL, OPT_TIMEBASE },
     { "pic-struct",        no_argument, NULL, 0 },
     { "crop-rect",   required_argument, NULL, 0 },
@@ -1323,6 +1330,67 @@ static int init_vid_filters( char *sequence, hnd_t *handle, video_info_t *info, 
     return 0;
 }
 
+static int starts_with( const char* test, const char* ref )
+{
+	do {
+		if(*ref == 0) {
+			if(*test == '\r' || *test == '\n' || *test == 0)
+				return 1;
+			return 0;
+		}
+		if(*test == 0) return 0;
+		if(*test++ != *ref++) return 0;
+	} while(1);
+}
+
+static int parse_pdfile( const char* pdfile_in, cli_opt_t *opt )
+{
+	FILE* fp = x264_fopen(pdfile_in, "r");
+	FAIL_IF_ERROR( !fp, "can't open pulldown file `%s'\n", pdfile_in );
+	
+	char buf[10];
+	int i_count = 0;
+	while(fgets(buf, sizeof(buf), fp)) i_count++;
+	
+	fseek(fp, 0, SEEK_SET);
+	opt->pdfile_data = malloc(i_count*sizeof(char));
+	opt->i_pdfile_frames = i_count;
+	
+	i_count = 0;
+	while(fgets(buf, sizeof(buf), fp)) {
+		int pic_struct = 4;
+		
+		if(starts_with(buf, "SGL") || starts_with(buf, "sgl"))
+			pic_struct = 1;
+		else if(starts_with(buf, "TB") || starts_with(buf, "tb"))
+			pic_struct = 16 + 4;
+		else if(starts_with(buf, "BT") || starts_with(buf, "bt"))
+			pic_struct = 16 + 5;
+		else if(starts_with(buf, "PTB") || starts_with(buf, "ptb"))
+			pic_struct = 4;
+		else if(starts_with(buf, "PBT") || starts_with(buf, "pbt"))
+			pic_struct = 5;
+		else if(starts_with(buf, "TBT") || starts_with(buf, "tbt"))
+			pic_struct = 6;
+		else if(starts_with(buf, "BTB") || starts_with(buf, "btb"))
+			pic_struct = 7;
+		else if(starts_with(buf, "DBL") || starts_with(buf, "dbl"))
+			pic_struct = 8;
+		else if(starts_with(buf, "TPL") || starts_with(buf, "tpl"))
+			pic_struct = 9;
+		else {
+            x264_cli_log( "x264", X264_LOG_ERROR, "pulldown file format error: %s\n", buf );
+            fclose(fp);
+            return -1;
+		}
+			
+		opt->pdfile_data[i_count++] = pic_struct;
+	}
+	
+	fclose(fp);
+	return 0;
+}
+
 static int parse_enum_name( const char *arg, const char * const *names, const char **dst )
 {
     for( int i = 0; names[i]; i++ )
@@ -1494,6 +1562,10 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
             case OPT_TCFILE_OUT:
                 opt->tcfile_out = x264_fopen( optarg, "wb" );
                 FAIL_IF_ERROR( !opt->tcfile_out, "can't open `%s'\n", optarg );
+                break;
+            case OPT_PDFILE_IN:
+                if( parse_pdfile( optarg, opt ) < 0 )
+                	return -1;
                 break;
             case OPT_TIMEBASE:
                 input_opt.timebase = optarg;
@@ -1877,15 +1949,17 @@ static int encode( x264_param_t *param, cli_opt_t *opt )
     opt->b_progress &= param->i_log_level < X264_LOG_DEBUG;
 
     /* set up pulldown */
-    if( opt->i_pulldown && !param->b_vfr_input )
+    if( (opt->i_pulldown || opt->pdfile_data) && !param->b_vfr_input )
     {
-        param->b_pulldown = 1;
         param->b_pic_struct = 1;
-        pulldown = &pulldown_values[opt->i_pulldown];
-        param->i_timebase_num = param->i_fps_den;
-        FAIL_IF_ERROR2( fmod( param->i_fps_num * pulldown->fps_factor, 1 ),
-                        "unsupported framerate for chosen pulldown\n" );
-        param->i_timebase_den = param->i_fps_num * pulldown->fps_factor;
+		if( opt->i_pulldown ) {
+	        param->b_pulldown = 1;
+	        pulldown = &pulldown_values[opt->i_pulldown];
+	        param->i_timebase_num = param->i_fps_den;
+	        FAIL_IF_ERROR2( fmod( param->i_fps_num * pulldown->fps_factor, 1 ),
+	                        "unsupported framerate for chosen pulldown\n" );
+	        param->i_timebase_den = param->i_fps_num * pulldown->fps_factor;
+		}
     }
 
     h = x264_encoder_open( param );
@@ -1926,9 +2000,30 @@ static int encode( x264_param_t *param, cli_opt_t *opt )
         if( !param->b_vfr_input )
             pic.i_pts = i_frame;
 
-        if( opt->i_pulldown && !param->b_vfr_input )
+        if( (opt->i_pulldown || opt->pdfile_data) && !param->b_vfr_input )
         {
-            pic.i_pic_struct = pulldown->pattern[ i_frame % pulldown->mod ];
+            if( opt->pdfile_data )
+            {
+				int i_pic_struct = ( i_frame < opt->i_pdfile_frames )
+					? opt->pdfile_data[i_frame]
+					: (0x10 + PIC_STRUCT_TOP_BOTTOM);
+				int b_interlaced = ((i_pic_struct & 0x10) != 0);
+				int b_tff = (i_pic_struct == (0x10 + PIC_STRUCT_TOP_BOTTOM));
+				pic.i_pic_struct = (i_pic_struct & 0xF);
+				
+				if(param->b_interlaced != b_interlaced ||
+				   param->b_tff != b_tff)
+				{
+					param->b_interlaced = b_interlaced;
+					param->b_tff = b_tff;
+					x264_encoder_reconfig(h, param);
+					
+					x264_cli_log( "x264", X264_LOG_INFO, "reconfig interlaced=%d, tff=%d\n", b_interlaced, b_tff );
+				}
+			}
+            else
+                pic.i_pic_struct = pulldown->pattern[ i_frame % pulldown->mod ];
+			
             pic.i_pts = (int64_t)( pulldown_pts + 0.5 );
             pulldown_pts += pulldown_frame_duration[pic.i_pic_struct];
         }
