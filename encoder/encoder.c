@@ -1786,6 +1786,7 @@ static int x264_encoder_try_reconfig( x264_t *h, x264_param_t *param, int *rc_re
     COPY( i_slice_count );
     COPY( i_slice_count_max );
     COPY( b_tff );
+    COPY( b_pulldown );
 
     /* VBV can't be turned on if it wasn't on to begin with */
     if( h->param.rc.i_vbv_max_bitrate > 0 && h->param.rc.i_vbv_buffer_size > 0 &&
@@ -2529,7 +2530,7 @@ static inline void x264_slice_init( x264_t *h, int i_nal_type, int i_global_qp )
     if( h->sps->i_poc_type == 0 )
     {
         h->sh.i_poc = h->fdec->i_poc;
-        if( PARAM_INTERLACED )
+        if( PARAM_INTERLACED && !h->param.b_pulldown )
         {
             h->sh.i_delta_poc_bottom = h->param.b_tff ? 1 : -1;
             h->sh.i_poc += h->sh.i_delta_poc_bottom == -1;

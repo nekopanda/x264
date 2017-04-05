@@ -1952,13 +1952,16 @@ static int encode( x264_param_t *param, cli_opt_t *opt )
     if( (opt->i_pulldown || opt->pdfile_data) && !param->b_vfr_input )
     {
         param->b_pic_struct = 1;
+        param->b_pulldown = 1;
+        param->i_timebase_num = param->i_fps_den;
 		if( opt->i_pulldown ) {
-	        param->b_pulldown = 1;
 	        pulldown = &pulldown_values[opt->i_pulldown];
-	        param->i_timebase_num = param->i_fps_den;
 	        FAIL_IF_ERROR2( fmod( param->i_fps_num * pulldown->fps_factor, 1 ),
 	                        "unsupported framerate for chosen pulldown\n" );
 	        param->i_timebase_den = param->i_fps_num * pulldown->fps_factor;
+		}
+		else {
+			param->i_timebase_den = param->i_fps_num;
 		}
     }
 
@@ -2007,18 +2010,16 @@ static int encode( x264_param_t *param, cli_opt_t *opt )
 				int i_pic_struct = ( i_frame < opt->i_pdfile_frames )
 					? opt->pdfile_data[i_frame]
 					: (0x10 + PIC_STRUCT_TOP_BOTTOM);
-				int b_interlaced = ((i_pic_struct & 0x10) != 0);
+				int b_pulldown = ((i_pic_struct & 0x10) == 0);
 				int b_tff = (i_pic_struct == (0x10 + PIC_STRUCT_TOP_BOTTOM));
 				pic.i_pic_struct = (i_pic_struct & 0xF);
 				
-				if(param->b_interlaced != b_interlaced ||
+				if(param->b_pulldown != b_pulldown ||
 				   param->b_tff != b_tff)
 				{
-					param->b_interlaced = b_interlaced;
+					param->b_pulldown = b_pulldown;
 					param->b_tff = b_tff;
 					x264_encoder_reconfig(h, param);
-					
-					x264_cli_log( "x264", X264_LOG_INFO, "reconfig interlaced=%d, tff=%d\n", b_interlaced, b_tff );
 				}
 			}
             else
